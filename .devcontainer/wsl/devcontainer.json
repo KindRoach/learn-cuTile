@@ -1,0 +1,18 @@
+{
+    "name": "learn-cuTile (WSL2)",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "runArgs": [
+        "--runtime=nvidia",
+        "--gpus=all",
+        "--volume=/usr/lib/wsl/lib:/usr/local/wsl/lib:ro"
+    ],
+    "remoteUser": "ubuntu",
+    "updateRemoteUserUID": true,
+    "initializeCommand": "mkdir -p ${localEnv:HOME}/.vscode-server-devcontainers ${localEnv:HOME}/.codex-devcontainers",
+    "mounts": [
+        "source=${localEnv:HOME}/.vscode-server-devcontainers,target=/home/ubuntu/.vscode-server,type=bind",
+        "source=${localEnv:HOME}/.codex-devcontainers,target=/home/ubuntu/.codex,type=bind"
+    ]
+}
