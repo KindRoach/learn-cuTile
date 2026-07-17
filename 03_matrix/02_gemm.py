@@ -1,5 +1,16 @@
+from itertools import product
+
 import torch
 import cuda.tile as ct
+
+
+ENABLE_AUTOTUNE = False
+FIXED_CONFIG = {
+    "tile_m": 64,
+    "tile_n": 128,
+    "tile_k": 32,
+    "occupancy": 4,
+}
 
 
 @ct.kernel
@@ -38,39 +49,88 @@ def matrix_multiplication(
     ct.store(output, index=(tile_m, tile_n), tile=accumulator.astype(output.dtype))
 
 
-def main():
-    tile_m = 64
-    tile_n = 64
-    tile_k = 32
+def matrix_multiplication_autotune(a, b, output):
+    keys = ("tile_m", "tile_n", "tile_k", "occupancy")
+    search_space = [
+        dict(zip(keys, values))
+        for values in product(
+            (32, 64, 128),
+            (32, 64, 128),
+            (32, 64, 128),
+            (1, 2, 4, 8, 16),
+        )
+    ]
 
-    # A is M x K, B is K x N; all dimensions exercise partial tiles.
-    m = 4096 + 1
-    n = 4096 + 2
-    k = 4096 + 3
+    result = ct.tune.exhaustive_search(
+        search_space=search_space,
+        stream=torch.cuda.current_stream(),
+        grid_fn=lambda cfg: (
+            ct.cdiv(a.shape[0], cfg["tile_m"]),
+            ct.cdiv(b.shape[1], cfg["tile_n"]),
+            1,
+        ),
+        kernel=matrix_multiplication,
+        # Each measurement gets a fresh output to prevent candidates from sharing state.
+        args_fn=lambda cfg: (
+            a,
+            b,
+            torch.empty_like(output),
+            cfg["tile_m"],
+            cfg["tile_n"],
+            cfg["tile_k"],
+        ),
+        hints_fn=lambda cfg: {"occupancy": cfg["occupancy"]},
+        quiet=True,
+    )
+
+    print(result)
+    return result.best.config
+
+
+def main():
+    m = 4096
+    n = 4096
+    k = 4096
 
     # Prepare the inputs, expected result, and output with PyTorch.
     a = torch.rand(m, k, device="cuda", dtype=torch.float16)
     b = torch.rand(k, n, device="cuda", dtype=torch.float16)
     expect = a @ b
-    output = torch.empty_like(expect)
 
-    # Each grid position corresponds to one output tile.
-    grid = (
-        ct.cdiv(m, tile_m),
-        ct.cdiv(n, tile_n),
-        1,
+    output = torch.empty_like(expect)
+    config = (
+        matrix_multiplication_autotune(a, b, output)
+        if ENABLE_AUTOTUNE
+        else FIXED_CONFIG
+    )
+    
+    # launch the kernel with the selected configuration.
+    kernel = matrix_multiplication.replace_hints(
+        occupancy=config["occupancy"]
     )
     ct.launch(
         torch.cuda.current_stream().cuda_stream,
-        grid,
-        matrix_multiplication,
-        (a, b, output, tile_m, tile_n, tile_k),
+        (
+            ct.cdiv(m, config["tile_m"]),
+            ct.cdiv(n, config["tile_n"]),
+            1,
+        ),
+        kernel,
+        (
+            a,
+            b,
+            output,
+            config["tile_m"],
+            config["tile_n"],
+            config["tile_k"],
+        ),
     )
     torch.cuda.synchronize()
 
     # Floating-point accumulation order may differ from PyTorch.
     torch.testing.assert_close(output, expect, rtol=1e-3, atol=1e-2)
-    print("matrix_multiplication passed")
+    mode = "autotuned" if ENABLE_AUTOTUNE else "fixed"
+    print(f"GEMM with {mode} config passed: {config}")
 
 
 if __name__ == "__main__":
